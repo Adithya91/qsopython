@@ -1,271 +1,296 @@
-#!/usr/bin/env python
-
-import pyopencl as cl
-import numpy as np
-import math
-from Quasarcl import *
-ASTRO_OBJ_SPEC_SIZE = 4096
-
-
-def calcGlobalSize(workGroupMultiple, dataSize):
-    size = dataSize
-    remainder = size % workGroupMultiple
-    if (remainder != 0):
-        size += workGroupMultiple - remainder
-    if (size < dataSize):
-        print("Error in calculating global_work_size.")
-    return size
-
-#To perform Chi-squared test
-def chisqs(QuasarCL,specFiltered,contFiltered,errFiltered,sizes,h,w): 
-    queue = cl.CommandQueue(QuasarCL.ctx)
-    globalSize = QuasarCL.calcGlobalSize(w)
-    output = np.zeros(w, dtype=np.double)
-    out_g = QuasarCL.writeBuffer(output)
-    
-    _knl = QuasarCL.buildKernel('tools_kernels.cl').chisq
-    _knl._wg_info_cache = {}
-    workGroupMultiple = _knl.get_work_group_info(
-        cl.kernel_work_group_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
-        QuasarCL.devices[0])
-    _knl.set_scalar_arg_dtypes(
-        [None, None, None, np.uint32, np.uint32, None, None])
-    _knl(queue, (globalSize,),
-         (workGroupMultiple,), specFiltered, contFiltered, errFiltered, w, h, sizes, out_g)
-    cl.enqueue_copy(queue, output, out_g)
-    size= len(output)  
-
-    globalSize = QuasarCL.calcGlobalSize(size)
-    _knl = QuasarCL.buildKernel('continuum_kernels.cl').reduce_continuum_chisqs
-
-    _knl.set_scalar_arg_dtypes(
-        [None, None, np.uint32])
-    _knl(queue, (globalSize,),
-         (QuasarCL.maxWorkGroupSize,), out_g, sizes, size)
-    cl.enqueue_copy(queue, output, out_g)
-    return output
-
-
-
-
-def calcCw(QuasarCL,wavelengthsMatrixFiltered, cReglinResults):
-    queue = cl.CommandQueue(QuasarCL.ctx)
-    
-    h = wavelengthsMatrixFiltered.shape[0]  # spectrumsSize
-    print(h)
-    w = wavelengthsMatrixFiltered.shape[1]  # spectrumsNumber
-    globalSize = QuasarCL.calcGlobalSize(h)
-
-    continuum = np.zeros((h, w), dtype=np.double)
-
-    wav_g = QuasarCL.readBuffer(wavelengthsMatrixFiltered)
-    creg_g = QuasarCL.readBuffer(cReglinResults)
-
-    cont_g = QuasarCL.writeBuffer(continuum)
-
-    _knl = QuasarCL.buildKernel('continuum_kernels.cl').calc_cw
-    _knl.set_scalar_arg_dtypes(
-        [None, None, np.uint32, None])
-    _knl(queue, (w, globalSize),
-         (1, QuasarCL.maxWorkGroupSize), wav_g, cont_g, h, creg_g)
-    cl.enqueue_copy(queue, continuum, cont_g)
-    return continuum
-
-
-def calcCfunDcfun(QuasarCL,
-        wavelengthsMatrix,
-        cReglinResultsVector,
-        reglinResultsVector):
-    queue = cl.CommandQueue(QuasarCL.ctx)
-        
-    h = wavelengthsMatrix.shape[0]  # spectrumsSize
-    w = wavelengthsMatrix.shape[1]  # spectrumsNumber
-    
-    cReglinResultsVector = cReglinResultsVector.astype('double')
-    reglinResultsVector = reglinResultsVector.astype('double')
-    dContinuums = np.zeros((h, w), dtype=np.double)
-    continuums = np.zeros((h, w), dtype=np.double)
-
-    wav_g = QuasarCL.readBuffer(wavelengthsMatrix)
-    dCon_g = QuasarCL.writeBuffer(dContinuums)
-    con_g = QuasarCL.writeBuffer(continuums)
-    cReg_g = QuasarCL.readBuffer(cReglinResultsVector)
-    reg_g = QuasarCL.readBuffer(reglinResultsVector)
-
-    _knl = QuasarCL.buildKernel('continuum_kernels.cl').calc_cfun_dcfun
-    _knl(queue, (w, ASTRO_OBJ_SPEC_SIZE),
-         (1, QuasarCL.maxWorkGroupSize), wav_g, dCon_g, con_g, cReg_g, reg_g)
-    cl.enqueue_copy(queue, dContinuums, dCon_g)
-    cl.enqueue_copy(queue, continuums, dCon_g)
-    cont_dict= {"dContinuum":dContinuums,
-                "continuum":continuums
-               }
-    return cont_dict
-
-
-def outputMatrixTran(QuasarCL,w,h):
-    outMat=np.zeros((w,h), dtype=np.float64)
-    outMat = np.transpose(np.asarray(outMat, dtype=np.float64, order='F'))   
-    out_g = QuasarCL.writeBuffer(outMat)
-    return outMat,out_g
-
-def outputMatrix(QuasarCL,w,h):
-    outMat=np.zeros((w,h), dtype=np.float64)
-    out_g = QuasarCL.writeBuffer(outMat)
-    return outMat,out_g
-
-#Merge filterWithWavelengthWindows,filterNonpositive,countIfNotInf,copyIfNotInf kernel functions 
-def filter_matrix(QuasarCL,
-        spectrumsMatrix,
-        wavelengthsMatrix,
-        errorsMatrix,
-        sizes,
-        windows,h,w,winSize):
-
-
-    queue = cl.CommandQueue(QuasarCL.ctx)    
-    
-    _knl = QuasarCL.buildKernel('spectrums_kernels.cl').filterWithWavelengthWindows
-    _knl.set_scalar_arg_dtypes(
-        [None, None, None, None, None, np.uint32])
-    _knl(queue, (w, ASTRO_OBJ_SPEC_SIZE), (1, QuasarCL.maxWorkGroupSize),
-         wavelengthsMatrix, spectrumsMatrix, errorsMatrix, sizes, windows, winSize)
-    
-
-    sp = spectrumsMatrix.int_ptr
-    wv = wavelengthsMatrix.int_ptr
-    er = errorsMatrix.int_ptr
-    
-        
-    _knl = QuasarCL.buildKernel('spectrums_kernels.cl').filterNonpositive
-    _knl(queue, (w, ASTRO_OBJ_SPEC_SIZE),
-         (1, QuasarCL.maxWorkGroupSize),cl.Buffer.from_int_ptr(sp),cl.Buffer.from_int_ptr(wv), cl.Buffer.from_int_ptr(er), sizes)
-    
-       
-    ###
-    newSizes = np.zeros(w, dtype=np.int32)
-    sizes_g = QuasarCL.writeBuffer(newSizes)
-    _knl = QuasarCL.buildKernel('tools_kernels.cl').countIfNotInf
-    _knl._wg_info_cache = {}
-    workGroupMultiple = _knl.get_work_group_info(
-        cl.kernel_work_group_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
-        QuasarCL.devices[0])
-    globalsize = calcGlobalSize(QuasarCL.maxWorkGroupSize, w)
-    _knl.set_scalar_arg_dtypes([None, np.uint32, np.uint32, None])
-    _knl(queue, (globalsize,),
-         (workGroupMultiple,), cl.Buffer.from_int_ptr(sp), w, h, sizes_g)
-    cl.enqueue_copy(queue, newSizes, sizes_g)
-    
-    maxs = max(newSizes)
-    maxs = maxs if maxs > 0 else 64
-    maxSize = QuasarCL.calcGlobalSize(maxs)
-    
-    ###
-        
-    outMat,out_g = outputMatrixTran(QuasarCL,w,maxSize)
-
-    _knl = QuasarCL.buildKernel('tools_kernels.cl').copyIfNotInf
-    _knl._wg_info_cache = {}
-    workGroupMultiple = _knl.get_work_group_info(
-        cl.kernel_work_group_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
-        QuasarCL.devices[0])
-    globalsize = QuasarCL.calcGlobalSize(w)
-    _knl.set_scalar_arg_dtypes([None, np.uint32, np.uint32, None, np.uint32])
-    
-    _knl(queue, (globalsize,),
-         (workGroupMultiple,), cl.Buffer.from_int_ptr(sp), w, h, out_g, maxSize)
-    cl.enqueue_copy(queue, outMat, out_g)
-    specMat = outMat
-    
-    
-    outMat,out_g = outputMatrixTran(QuasarCL,w,maxSize)
-    _knl(queue, (globalsize,),
-         (workGroupMultiple,), cl.Buffer.from_int_ptr(wv), w, h, out_g, maxSize)
-    cl.enqueue_copy(queue, outMat, out_g)
-    wavMat = outMat
-        
-
-    outMat,out_g = outputMatrixTran(QuasarCL,w,maxSize)
-    _knl(queue, (globalsize,),
-         (workGroupMultiple,), cl.Buffer.from_int_ptr(er), w, h, out_g, maxSize)
-    cl.enqueue_copy(queue, outMat, out_g)
-    errMat = outMat    
-    
-    out = {
-    "wavelengthsMatrix":wavMat,
-    "spectrumsMatrix":specMat,
-    "errorsMatrix":errMat,
-    "newSizes":newSizes,
-    "maxSize":maxSize,
-           }
-    #print("continuum results:",out)
-    return out
-
-
-#Perform linear regression    
-def reglin_results(QuasarCL,
-        waveFiltered,
-        specFiltered,ampWavelength,sizes,h,w):
-    
-    queue = cl.CommandQueue(QuasarCL.ctx)
-    wav = waveFiltered.int_ptr
-    cReglinResults,out_g = outputMatrix(QuasarCL,w,8)
-     
-    globalSize = QuasarCL.calcGlobalSize(w)
-    _knl = QuasarCL.buildKernel('tools_kernels.cl').reglin
-    _knl._wg_info_cache = {}
-    workGroupMultiple = _knl.get_work_group_info(
-        cl.kernel_work_group_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
-        QuasarCL.devices[0])
-    _knl.set_scalar_arg_dtypes(
-        [None, None, np.uint32, np.uint32, None, None])
-    _knl(queue, (globalSize,),
-         (workGroupMultiple,), waveFiltered, specFiltered, w, h, sizes, out_g)
-    cr_g = out_g
-    cl.enqueue_copy(queue, cReglinResults, out_g)
-    size = len(cReglinResults)
-     
-    
-    if ampWavelength > (math.pow(2.225074e-308, 10.001)):
-        lampLog10 = math.log10(ampWavelength)
-        _knl = QuasarCL.buildKernel('basics_kernels.cl').matrix_minus_scalar
-        _knl.set_scalar_arg_dtypes(
-                         [None, np.uint32, np.double])
-        _knl(queue, (h, globalSize),
-        (1, QuasarCL.maxWorkGroupSize), waveFiltered, w, lampLog10)
-        wav = waveFiltered.int_ptr
-        
-    
-    reglinResults,out_g = outputMatrix(QuasarCL,w,8)
-    _knl = QuasarCL.buildKernel('tools_kernels.cl').reglin
-    _knl._wg_info_cache = {}
-    workGroupMultiple = _knl.get_work_group_info(
-        cl.kernel_work_group_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
-        QuasarCL.devices[0])
-    _knl.set_scalar_arg_dtypes(
-        [None, None, np.uint32, np.uint32, None, None])
-    _knl(queue, (globalSize,),
-         (workGroupMultiple,), cl.Buffer.from_int_ptr(wav), specFiltered, w, h, sizes, out_g)
-   
-    r_g = out_g
-
-    
-    globalSize = QuasarCL.calcGlobalSize(size)
-    cReg = np.zeros((size,8), dtype=np.double)
-    reg = np.zeros((size,8), dtype=np.double)
-
-    _knl = QuasarCL.buildKernel('continuum_kernels.cl').fix_reglin_results
-    _knl.set_scalar_arg_dtypes(
-        [None, None, np.uint32])
-    _knl(queue, (globalSize,),
-         (QuasarCL.maxWorkGroupSize,), cr_g, r_g, size)
-    cl.enqueue_copy(queue, cReg,cr_g)
-    cl.enqueue_copy(queue, reg, r_g)
-    
-    reglin_dict = {"cReglinResults":cReg,"reglinResults":reg}
-    
-    return reglin_dict          
- 
-
-
-    
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "name": "Untitled9.ipynb",
+      "provenance": []
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "ePTOM_MBbfPb",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "#!/usr/bin/env python\n",
+        "\n",
+        "import pyopencl as cl\n",
+        "import numpy as np\n",
+        "import math\n",
+        "from QsoCL import *\n",
+        "ASTRO_OBJ_SPEC_SIZE = 4096\n",
+        "\n",
+        "\n",
+        "def calcGlobalSize(workGroupMultiple, dataSize):\n",
+        "    size = dataSize\n",
+        "    remainder = size % workGroupMultiple\n",
+        "    if (remainder != 0):\n",
+        "        size += workGroupMultiple - remainder\n",
+        "    if (size < dataSize):\n",
+        "        print(\"Error in calculating global_work_size.\")\n",
+        "    return size\n",
+        "\n",
+        "#To perform Chi-squared test\n",
+        "def chisqs(QsoCL,specFiltered,contFiltered,errFiltered,sizes,h,w): \n",
+        "    queue = cl.CommandQueue(QsoCL.ctx)\n",
+        "    globalSize = QsoCL.calcGlobalSize(w)\n",
+        "    output = np.zeros(w, dtype=np.double)\n",
+        "    out_g = QsoCL.writeBuffer(output)\n",
+        "    \n",
+        "    _knl = QsoCL.buildKernel('tools_kernels.cl').chisq\n",
+        "    _knl._wg_info_cache = {}\n",
+        "    workGroupMultiple = _knl.get_work_group_info(\n",
+        "        cl.kernel_work_group_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE,\n",
+        "        QsoCL.devices[0])\n",
+        "    _knl.set_scalar_arg_dtypes(\n",
+        "        [None, None, None, np.uint32, np.uint32, None, None])\n",
+        "    _knl(queue, (globalSize,),\n",
+        "         (workGroupMultiple,), specFiltered, contFiltered, errFiltered, w, h, sizes, out_g)\n",
+        "    cl.enqueue_copy(queue, output, out_g)\n",
+        "    size= len(output)  \n",
+        "\n",
+        "    globalSize = QsoCL.calcGlobalSize(size)\n",
+        "    _knl = QsoCL.buildKernel('continuum_kernels.cl').reduce_continuum_chisqs\n",
+        "\n",
+        "    _knl.set_scalar_arg_dtypes(\n",
+        "        [None, None, np.uint32])\n",
+        "    _knl(queue, (globalSize,),\n",
+        "         (QsoCL.maxWorkGroupSize,), out_g, sizes, size)\n",
+        "    cl.enqueue_copy(queue, output, out_g)\n",
+        "    return output\n",
+        "\n",
+        "\n",
+        "\n",
+        "\n",
+        "def calcCw(QsoCL,wavelengthsMatrixFiltered, cReglinResults):\n",
+        "    queue = cl.CommandQueue(QsoCL.ctx)\n",
+        "    \n",
+        "    h = wavelengthsMatrixFiltered.shape[0]  # spectrumsSize\n",
+        "    print(h)\n",
+        "    w = wavelengthsMatrixFiltered.shape[1]  # spectrumsNumber\n",
+        "    globalSize = QsoCL.calcGlobalSize(h)\n",
+        "\n",
+        "    continuum = np.zeros((h, w), dtype=np.double)\n",
+        "\n",
+        "    wav_g = QsoCL.readBuffer(wavelengthsMatrixFiltered)\n",
+        "    creg_g = QsoCL.readBuffer(cReglinResults)\n",
+        "\n",
+        "    cont_g = QsoCL.writeBuffer(continuum)\n",
+        "\n",
+        "    _knl = QsoCL.buildKernel('continuum_kernels.cl').calc_cw\n",
+        "    _knl.set_scalar_arg_dtypes(\n",
+        "        [None, None, np.uint32, None])\n",
+        "    _knl(queue, (w, globalSize),\n",
+        "         (1, QsoCL.maxWorkGroupSize), wav_g, cont_g, h, creg_g)\n",
+        "    cl.enqueue_copy(queue, continuum, cont_g)\n",
+        "    return continuum\n",
+        "\n",
+        "\n",
+        "def calcCfunDcfun(QsoCL,\n",
+        "        wavelengthsMatrix,\n",
+        "        cReglinResultsVector,\n",
+        "        reglinResultsVector):\n",
+        "    queue = cl.CommandQueue(QsoCL.ctx)\n",
+        "        \n",
+        "    h = wavelengthsMatrix.shape[0]  # spectrumsSize\n",
+        "    w = wavelengthsMatrix.shape[1]  # spectrumsNumber\n",
+        "    \n",
+        "    cReglinResultsVector = cReglinResultsVector.astype('double')\n",
+        "    reglinResultsVector = reglinResultsVector.astype('double')\n",
+        "    dContinuums = np.zeros((h, w), dtype=np.double)\n",
+        "    continuums = np.zeros((h, w), dtype=np.double)\n",
+        "\n",
+        "    wav_g = QsoCL.readBuffer(wavelengthsMatrix)\n",
+        "    dCon_g = QsoCL.writeBuffer(dContinuums)\n",
+        "    con_g = QsoCL.writeBuffer(continuums)\n",
+        "    cReg_g = QsoCL.readBuffer(cReglinResultsVector)\n",
+        "    reg_g = QsoCL.readBuffer(reglinResultsVector)\n",
+        "\n",
+        "    _knl = QsoCL.buildKernel('continuum_kernels.cl').calc_cfun_dcfun\n",
+        "    _knl(queue, (w, ASTRO_OBJ_SPEC_SIZE),\n",
+        "         (1, QsoCL.maxWorkGroupSize), wav_g, dCon_g, con_g, cReg_g, reg_g)\n",
+        "    cl.enqueue_copy(queue, dContinuums, dCon_g)\n",
+        "    cl.enqueue_copy(queue, continuums, dCon_g)\n",
+        "    cont_dict= {\"dContinuum\":dContinuums,\n",
+        "                \"continuum\":continuums\n",
+        "               }\n",
+        "    return cont_dict\n",
+        "\n",
+        "\n",
+        "def outputMatrixTran(QsoCL,w,h):\n",
+        "    outMat=np.zeros((w,h), dtype=np.float64)\n",
+        "    outMat = np.transpose(np.asarray(outMat, dtype=np.float64, order='F'))   \n",
+        "    out_g = QsoCL.writeBuffer(outMat)\n",
+        "    return outMat,out_g\n",
+        "\n",
+        "def outputMatrix(QsoCL,w,h):\n",
+        "    outMat=np.zeros((w,h), dtype=np.float64)\n",
+        "    out_g = QsoCL.writeBuffer(outMat)\n",
+        "    return outMat,out_g\n",
+        "\n",
+        "#Merge filterWithWavelengthWindows,filterNonpositive,countIfNotInf,copyIfNotInf kernel functions \n",
+        "def filter_matrix(QsoCL,\n",
+        "        spectrumsMatrix,\n",
+        "        wavelengthsMatrix,\n",
+        "        errorsMatrix,\n",
+        "        sizes,\n",
+        "        windows,h,w,winSize):\n",
+        "\n",
+        "\n",
+        "    queue = cl.CommandQueue(QsoCL.ctx)    \n",
+        "    \n",
+        "    _knl = QsoCL.buildKernel('spectrums_kernels.cl').filterWithWavelengthWindows\n",
+        "    _knl.set_scalar_arg_dtypes(\n",
+        "        [None, None, None, None, None, np.uint32])\n",
+        "    _knl(queue, (w, ASTRO_OBJ_SPEC_SIZE), (1, QsoCL.maxWorkGroupSize),\n",
+        "         wavelengthsMatrix, spectrumsMatrix, errorsMatrix, sizes, windows, winSize)\n",
+        "    \n",
+        "\n",
+        "    sp = spectrumsMatrix.int_ptr\n",
+        "    wv = wavelengthsMatrix.int_ptr\n",
+        "    er = errorsMatrix.int_ptr\n",
+        "    \n",
+        "        \n",
+        "    _knl = QsoCL.buildKernel('spectrums_kernels.cl').filterNonpositive\n",
+        "    _knl(queue, (w, ASTRO_OBJ_SPEC_SIZE),\n",
+        "         (1, QsoCL.maxWorkGroupSize),cl.Buffer.from_int_ptr(sp),cl.Buffer.from_int_ptr(wv), cl.Buffer.from_int_ptr(er), sizes)\n",
+        "    \n",
+        "       \n",
+        "    ###\n",
+        "    newSizes = np.zeros(w, dtype=np.int32)\n",
+        "    sizes_g = QsoCL.writeBuffer(newSizes)\n",
+        "    _knl = QsoCL.buildKernel('tools_kernels.cl').countIfNotInf\n",
+        "    _knl._wg_info_cache = {}\n",
+        "    workGroupMultiple = _knl.get_work_group_info(\n",
+        "        cl.kernel_work_group_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE,\n",
+        "        QsoCL.devices[0])\n",
+        "    globalsize = calcGlobalSize(QsoCL.maxWorkGroupSize, w)\n",
+        "    _knl.set_scalar_arg_dtypes([None, np.uint32, np.uint32, None])\n",
+        "    _knl(queue, (globalsize,),\n",
+        "         (workGroupMultiple,), cl.Buffer.from_int_ptr(sp), w, h, sizes_g)\n",
+        "    cl.enqueue_copy(queue, newSizes, sizes_g)\n",
+        "    \n",
+        "    maxs = max(newSizes)\n",
+        "    maxs = maxs if maxs > 0 else 64\n",
+        "    maxSize = QsoCL.calcGlobalSize(maxs)\n",
+        "    \n",
+        "    ###\n",
+        "        \n",
+        "    outMat,out_g = outputMatrixTran(QsoCL,w,maxSize)\n",
+        "\n",
+        "    _knl = QsoCL.buildKernel('tools_kernels.cl').copyIfNotInf\n",
+        "    _knl._wg_info_cache = {}\n",
+        "    workGroupMultiple = _knl.get_work_group_info(\n",
+        "        cl.kernel_work_group_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE,\n",
+        "        QsoCL.devices[0])\n",
+        "    globalsize = QsoCL.calcGlobalSize(w)\n",
+        "    _knl.set_scalar_arg_dtypes([None, np.uint32, np.uint32, None, np.uint32])\n",
+        "    \n",
+        "    _knl(queue, (globalsize,),\n",
+        "         (workGroupMultiple,), cl.Buffer.from_int_ptr(sp), w, h, out_g, maxSize)\n",
+        "    cl.enqueue_copy(queue, outMat, out_g)\n",
+        "    specMat = outMat\n",
+        "    \n",
+        "    \n",
+        "    outMat,out_g = outputMatrixTran(QsoCL,w,maxSize)\n",
+        "    _knl(queue, (globalsize,),\n",
+        "         (workGroupMultiple,), cl.Buffer.from_int_ptr(wv), w, h, out_g, maxSize)\n",
+        "    cl.enqueue_copy(queue, outMat, out_g)\n",
+        "    wavMat = outMat\n",
+        "        \n",
+        "\n",
+        "    outMat,out_g = outputMatrixTran(QsoCL,w,maxSize)\n",
+        "    _knl(queue, (globalsize,),\n",
+        "         (workGroupMultiple,), cl.Buffer.from_int_ptr(er), w, h, out_g, maxSize)\n",
+        "    cl.enqueue_copy(queue, outMat, out_g)\n",
+        "    errMat = outMat    \n",
+        "    \n",
+        "    out = {\n",
+        "    \"wavelengthsMatrix\":wavMat,\n",
+        "    \"spectrumsMatrix\":specMat,\n",
+        "    \"errorsMatrix\":errMat,\n",
+        "    \"newSizes\":newSizes,\n",
+        "    \"maxSize\":maxSize,\n",
+        "           }\n",
+        "    #print(\"continuum results:\",out)\n",
+        "    return out\n",
+        "\n",
+        "\n",
+        "#Perform linear regression    \n",
+        "def reglin_results(QsoCL,\n",
+        "        waveFiltered,\n",
+        "        specFiltered,ampWavelength,sizes,h,w):\n",
+        "    \n",
+        "    queue = cl.CommandQueue(QsoCL.ctx)\n",
+        "    wav = waveFiltered.int_ptr\n",
+        "    cReglinResults,out_g = outputMatrix(QsoCL,w,8)\n",
+        "     \n",
+        "    globalSize = QsoCL.calcGlobalSize(w)\n",
+        "    _knl = QsoCL.buildKernel('tools_kernels.cl').reglin\n",
+        "    _knl._wg_info_cache = {}\n",
+        "    workGroupMultiple = _knl.get_work_group_info(\n",
+        "        cl.kernel_work_group_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE,\n",
+        "        QsoCL.devices[0])\n",
+        "    _knl.set_scalar_arg_dtypes(\n",
+        "        [None, None, np.uint32, np.uint32, None, None])\n",
+        "    _knl(queue, (globalSize,),\n",
+        "         (workGroupMultiple,), waveFiltered, specFiltered, w, h, sizes, out_g)\n",
+        "    cr_g = out_g\n",
+        "    cl.enqueue_copy(queue, cReglinResults, out_g)\n",
+        "    size = len(cReglinResults)\n",
+        "     \n",
+        "    \n",
+        "    if ampWavelength > (math.pow(2.225074e-308, 10.001)):\n",
+        "        lampLog10 = math.log10(ampWavelength)\n",
+        "        _knl = QsoCL.buildKernel('basics_kernels.cl').matrix_minus_scalar\n",
+        "        _knl.set_scalar_arg_dtypes(\n",
+        "                         [None, np.uint32, np.double])\n",
+        "        _knl(queue, (h, globalSize),\n",
+        "        (1, QsoCL.maxWorkGroupSize), waveFiltered, w, lampLog10)\n",
+        "        wav = waveFiltered.int_ptr\n",
+        "        \n",
+        "    \n",
+        "    reglinResults,out_g = outputMatrix(QsoCL,w,8)\n",
+        "    _knl = QsoCL.buildKernel('tools_kernels.cl').reglin\n",
+        "    _knl._wg_info_cache = {}\n",
+        "    workGroupMultiple = _knl.get_work_group_info(\n",
+        "        cl.kernel_work_group_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE,\n",
+        "        QsoCL.devices[0])\n",
+        "    _knl.set_scalar_arg_dtypes(\n",
+        "        [None, None, np.uint32, np.uint32, None, None])\n",
+        "    _knl(queue, (globalSize,),\n",
+        "         (workGroupMultiple,), cl.Buffer.from_int_ptr(wav), specFiltered, w, h, sizes, out_g)\n",
+        "   \n",
+        "    r_g = out_g\n",
+        "\n",
+        "    \n",
+        "    globalSize = QsoCL.calcGlobalSize(size)\n",
+        "    cReg = np.zeros((size,8), dtype=np.double)\n",
+        "    reg = np.zeros((size,8), dtype=np.double)\n",
+        "\n",
+        "    _knl = QsoCL.buildKernel('continuum_kernels.cl').fix_reglin_results\n",
+        "    _knl.set_scalar_arg_dtypes(\n",
+        "        [None, None, np.uint32])\n",
+        "    _knl(queue, (globalSize,),\n",
+        "         (QsoCL.maxWorkGroupSize,), cr_g, r_g, size)\n",
+        "    cl.enqueue_copy(queue, cReg,cr_g)\n",
+        "    cl.enqueue_copy(queue, reg, r_g)\n",
+        "    \n",
+        "    reglin_dict = {\"cReglinResults\":cReg,\"reglinResults\":reg}\n",
+        "    \n",
+        "    return reglin_dict          \n",
+        " "
+      ],
+      "execution_count": 0,
+      "outputs": []
+    }
+  ]
+}
