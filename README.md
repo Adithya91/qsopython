@@ -1,2 +1,2 @@
 # qsopython
-A python implementation of Quasarcl R package 
+A python implementation of paramaterization R package 
