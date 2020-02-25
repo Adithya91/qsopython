@@ -7,7 +7,7 @@ import os
 #Class to initialize buffer objects and build kernel functions
 
 
-class Quasarcl:
+class Qsocl:
   def __init__(self):
     print("Constructor Initialized")
     # Context
